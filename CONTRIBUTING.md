@@ -260,7 +260,7 @@ statements, add parentheses to ease readability.
 ## ifdef hell
 
 Avoid ifdef's as much as possible.
-Platform support checking should be performed in configure.librdkafka.
+Platform support checking should be performed in configure.self.
 
 
 

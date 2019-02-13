@@ -215,3 +215,6 @@ lib-clean: generic-clean lib-clean-pkg-config
 
 bin-clean: generic-clean
 	rm -f $(BIN)
+
+deps-clean:
+	rm -rf "$(MKLOVE_DIR)/deps"

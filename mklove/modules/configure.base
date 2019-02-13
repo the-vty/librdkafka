@@ -13,9 +13,12 @@ MKL_LOAD_STACK=""
 
 MKL_IDNEXT=1
 
-MKL_OUTMK=_mklout.mk
-MKL_OUTH=_mklout.h
-MKL_OUTDBG=config.log
+# Default mklove directory to PWD/mklove
+[[ -z "$MKLOVE_DIR" ]] && MKLOVE_DIR="$PWD/mklove"
+
+MKL_OUTMK="$PWD/_mklout.mk"
+MKL_OUTH="$PWD/_mklout.h"
+MKL_OUTDBG="$PWD/config.log"
 
 MKL_GENERATORS="base:mkl_generate_late_vars"
 MKL_CLEANERS=""
@@ -33,15 +36,13 @@ MKL_CLR_RESET=""
 
 
 MKL_NO_DOWNLOAD=0
+MKL_INSTALL_DEPS=n
+MKL_SOURCE_DEPS_ONLY=n
 
 if [[ -z "$MKL_REPO_URL" ]]; then
     MKL_REPO_URL="http://github.com/edenhill/mklove/raw/master"
 fi
 
-
-
-# Default mklove directory to PWD/mklove
-[[ -z "$MKLOVE_DIR" ]] && MKLOVE_DIR=mklove
 
 
 ###########################################################################
@@ -304,6 +305,205 @@ function mkl_allvar_set {
 }
 
 
+###########################################################################
+#
+# Dependency installation, et.al.
+#
+#
+###########################################################################
+
+# Returns the local dependency directory.
+function mkl_depdir {
+    local dir="$MKLOVE_DIR/deps"
+    [[ -d $dir ]] || mkdir -p "$dir"
+    if ! grep -q ^deps$ "$MKLOVE_DIR/.gitignore" 2>/dev/null ; then
+        echo "deps" >> "$MKLOVE_DIR/.gitignore"
+    fi
+
+    echo "$dir"
+}
+
+
+# Get the static library file name(s) for a package.
+function mkl_dep_staticlib_name {
+    local name=$1
+    local fname=$(mkl_meta_get $name "static" "")
+
+    if [[ -z $fname ]]; then
+        fname="lib${name#lib}.a"
+    fi
+
+    echo $fname
+}
+
+
+# Install an external dependency using the platform's native
+# package manager.
+# Should only be called from mkl_dep_install
+#
+# Param 1: config name
+function mkl_dep_install_pkg {
+    local name=$1
+    local iname="${name}_inst"
+    local retcode=1  # default to fail
+    local method="none"
+
+    mkl_dbg "Attempting native install of dependency $name on $MKL_DISTRO with effective user $EUID"
+
+    # Try the platform specific installer first.
+    case ${MKL_DISTRO}-${EUID} in
+        Debian-0|Ubuntu-0)
+            method=apt
+            local pkgs=$(mkl_meta_get $name deb)
+            if [[ -n $pkgs ]]; then
+                mkl_check_begin --verb "installing dependency" $iname "" no-cache "$name"
+                apt install -y $pkgs >>$MKL_OUTDBG 2>&1
+                retcode=$?
+            fi
+            ;;
+
+        osx-*)
+            local pkgs=$(mkl_meta_get $name brew)
+            if [[ -n $pkgs ]]; then
+                method=brew
+                mkl_check_begin --verb "installing dependency" $iname "" no-cache "$name"
+                brew install $pkgs >>$MKL_OUTDBG 2>&1
+                retcode=$?
+            fi
+            ;;
+
+        *)
+            mkl_dbg "No native installer set for $name"
+            return 1
+            ;;
+    esac
+
+    if [[ $retcode -eq 0 ]]; then
+        mkl_dbg "Native install of $name (using $method) succeeded"
+        mkl_check_done "$iname" "" cont "using $method"
+    else
+        mkl_dbg "Native install of $name (using $method) failed: retcode $retcode"
+        mkl_check_failed "$iname" "" cont "using $method"
+    fi
+
+    return $retcode
+}
+
+
+# Returns 0 (yes) if this dependency has a source builder, else 1 (no)
+function mkl_dep_has_builder {
+    local name=$1
+
+    local func="${name}_install_source"
+    mkl_func_exists $func
+}
+
+
+# Install an external dependency from source.
+#
+# The resulting libraries must be installed in $bdir/usr/lib (or lib64),
+# and include files in $bdir/usr/include.
+#
+# Param 1: config name
+function mkl_dep_install_source {
+    local name=$1
+    local iname="${name}_src"
+    local retcode=
+
+    local func="${name}_install_source"
+
+    if ! mkl_func_exists $func ; then
+        mkl_dbg "No source builder for $name ($func) available"
+        return 1
+    fi
+
+    mkl_check_begin --verb "building dependency" $iname "" no-cache "$name"
+
+    # Create and go to source directory
+    local bdir="$(mkl_depdir)"
+    local sdir="$bdir/src-$name"
+    [[ -d "$sdir" ]] || mkdir -p "$sdir"
+    mkl_pushd "$sdir"
+
+    local ilog="${sdir}/_mkl_install.log"
+
+    # Build and install
+    mkl_dbg "Building $name from source in $sdir (func $func)"
+
+    $func $name "$bdir" >$ilog 2>&1
+    retcode=$?
+
+    mkl_popd # $sdir
+
+    if [[ $retcode -eq 0 ]]; then
+        mkl_dbg "Source install of $name succeeded"
+        mkl_check_done "$iname" "" cont "ok" "from source"
+    else
+        mkl_dbg "Source install of $name failed"
+        mkl_check_failed "$iname" "" disable "source installer failed (see $ilog)"
+        mkl_err "$name source build failed, see $ilog for details. Last 50 lines:"
+        tail -50 "$ilog"
+    fi
+
+    return $retcode
+}
+
+
+# Install an external dependecy
+#
+# Param 1: config name  (e.g zstd)
+function mkl_dep_install {
+    local name=$1
+    local retcode=
+
+    if [[ $MKL_SOURCE_DEPS_ONLY != y ]]; then
+        #
+        # Try native package manager first
+        #
+        mkl_dep_install_pkg $name
+        retcode=$?
+
+        if [[ $retcode -ne 0 ]]; then
+            return $retcode
+        fi
+    fi
+
+    #
+    # Try source installer
+    #
+    mkl_dep_install_source $name
+    retcode=$?
+
+    if [[ $retcode -ne 0 ]]; then
+        return $retcode
+    fi
+
+    # Find the static library(s), if any.
+    local stlibfnames=$(mkl_dep_staticlib_name $name)
+    local stlibvar="STATIC_LIB_${name}"
+
+    if [[ -n $stlibfnames && -z "${!stlibvar}" ]]; then
+        local fname=
+        local stlibs=""
+        mkl_dbg "$name: resolving static libraries from $stlibfnames"
+        for fname in $stlibfnames ; do
+            local stlib=$(find "$bdir/usr" -name "$fname" 2>/dev/null | head -1)
+            if [[ -n $stlib ]]; then
+                stlibs="${stlibs} $stlib"
+            fi
+        done
+
+        if [[ -n $stlibs ]]; then
+            mkl_dbg "$name: $stlibvar: found static libs: $stlibs"
+            mkl_var0_set $stlibvar "$stlibs"
+        else
+            mkl_dbg "$name: did not find any static libraries for $stlibfnames in $bdir/lib"
+        fi
+    fi
+
+    return $retcode
+}
+
 
 
 ###########################################################################
@@ -421,14 +621,13 @@ function mkl_check_failed {
     [[ $MKL_FAILFATAL ]] && action="fail"
 
     mkl_check_done "$1" "$2" "$action" "failed"
-
     mkl_dbg "Check $1 ($2, action $action (originally $3)) failed: $4"
 
 
     case $action in
         fail)
             # Check failed fatally, fail everything eventually
-            mkl_fail "$1" "$2" "$3" "$4$extra"
+            mkl_fail "$1" "$2" "$3" "$4"
             return 1
             ;;
 
@@ -615,7 +814,7 @@ function mkl_dbg {
     if [[ ! -z $MKL_DEBUG ]]; then
         echo -e "${MKL_BLUE}DBG:$$: $*${MKL_CLR_RESET}" 1>&2
     fi
-    echo "DBG: $*" >> $MKL_OUTDBG
+    echo "DBG $$: $*" >> $MKL_OUTDBG
 }
 
 # Error print (with color)
@@ -755,6 +954,14 @@ function mkl_in_list {
 }
 
 
+# Silent versions of pushd and popd
+function mkl_pushd {
+    pushd "$1" >/dev/null
+}
+
+function mkl_popd {
+    popd >/dev/null
+}
 
 
 ###########################################################################
@@ -876,7 +1083,7 @@ function mkl_check_begin {
     fi
 
     local name=$(mkl_meta_get $1 name "$4")
-    [[ -z $name ]] && name="x:$1"
+    [[ -z $name ]] && name="$1"
 
     echo -n "$verb $name..."
     if [[ $3 != "no-cache" ]]; then
@@ -893,6 +1100,28 @@ function mkl_check_begin {
     return 1
 }
 
+
+# Calls the manual_checks function for the given module.
+# Use this for modules that provide check hooks that require
+# certain call ordering, such as dependent library checks.
+#
+# Param 1: module name
+# Param 2: action
+function mkl_check {
+    local modname=$1
+    local action=$2
+
+    local func="${modname}_manual_checks"
+    if ! mkl_func_exists "$func" ; then
+        mkl_fail "Check function for module $modname not found: missing mkl_requre $modname ?"
+        return 1
+    fi
+
+    $func "$2"
+    return $?
+}
+
+
 # Print that a check is done
 # Arguments:
 #  config name
@@ -904,6 +1133,8 @@ function mkl_check_done {
     # Clean up configname to be a safe varname
     local cname=${1//-/_}
     mkl_var_set "MKL_STATUS_$cname" "$4" cache
+
+    mkl_dbg "Setting $1 ($cname) status to $4 (action $3)"
 
     local extra=""
     if [[ $4 = "failed" ]]; then
@@ -1026,24 +1257,28 @@ $output"
 
 # Tries to figure out if we can use a static library or not.
 # Arguments:
-#  library name   (e.g. -lrdkafka)
-#  compiler flags (optional "", e.g: "-lyajl")
+#  config name    (e.g., zstd)
+#  compiler flags (optional "", e.g: "-lzstd")
 # Returns/outputs:
 #  New list of compiler flags
 function mkl_lib_check_static {
-    local libname=$1
+    local configname=$1
     local libs=$2
-    local arfile_var=STATIC_LIB_${libname#-l}
+    local arfile_var=STATIC_LIB_${configname}
 
-    mkl_dbg "Check $libname for static library (libs $libs, arfile variable $arfile_var=${!arfile_var})"
+    mkl_dbg "Check $configname for static library (libs $libs, arfile variable $arfile_var=${!arfile_var})"
 
-    # If STATIC_LIB_<libname_without_-l> specifies an existing .a file we
-    # use that instead.
-    if [[ -f ${!arfile_var} ]]; then
-	libs=$(echo $libs | sed -e "s|$libname|${!arfile_var}|g")
+    # If STATIC_LIB_<configname> specifies .a file(s) we use that instead.
+    if [[ -n ${!arfile_var} ]]; then
+        libs="${!arfile_var}"
+        mkl_allvar_set "$configname" "${configname}_STATIC" "y"
     elif [[ $HAS_LDFLAGS_STATIC == y ]]; then
-        libs=$(echo $libs | sed -e "s|$libname|${LDFLAGS_STATIC} $libname ${LDFLAGS_DYNAMIC}|g")
-        mkl_allvar_set "$configname" "${defname}_STATIC" "y"
+        local libname
+        for libname in $libs; do
+            libs=$(echo $libs | sed -e "s|$libname|${LDFLAGS_STATIC} $libname ${LDFLAGS_DYNAMIC}|g")
+        done
+        mkl_dbg "$configname: after replacing libs: $libs"
+        mkl_allvar_set "$configname" "${configname}_STATIC" "y"
     else
         mkl_dbg "$libname: Neither $arfile_var=/path/to/libname.a specified nor static linker flags supported: static linking probably won't work"
         libs=""
@@ -1063,8 +1298,7 @@ function mkl_lib_check_static {
 # and config.h) if the library is to be linked statically.
 #
 # Arguments:
-#  [--static=<lib>]  (allows static linking (--enable-static) for the
-#                     library provided, e.g.: --static=-lrdkafka "librdkafka"..)
+#  [--override-action=<action>]  (internal use, overrides action argument)
 #  [--libname=<lib>] (library name if different from config name, such as
 #                     when the libname includes a dash)
 #  config name (library name (for pkg-config))
@@ -1073,13 +1307,15 @@ function mkl_lib_check_static {
 #  compiler (CC|CXX)
 #  compiler flags (optional "", e.g: "-lyajl")
 #  source snippet
-function mkl_lib_check {
+function mkl_lib_check0 {
 
-    local staticopt=
-    if [[ $1 == --static* ]]; then
-        staticopt=$1
+    local override_action=
+    if [[ $1 == --override-action=* ]]; then
+        override_action=${1#*=}
         shift
     fi
+
+    local staticopt=$(mkl_meta_get $1 "static" "")
 
     local libnameopt=
     local libname=$1
@@ -1089,27 +1325,31 @@ function mkl_lib_check {
         shift
     fi
 
+    local action=$3
+    if [[ -n $override_action ]]; then
+        action=$override_action
+    fi
+
     # pkg-config result (0=ok)
     local pkg_conf_failed=1
     if [[ $WITH_PKGCONFIG == "y" ]]; then
         # Let pkg-config populate CFLAGS, et.al.
-        mkl_pkg_config_check $staticopt $libnameopt "$1" "$2" cont
+        mkl_pkg_config_check $libnameopt "$1" "$2" cont
         pkg_conf_failed=$?
     fi
 
     local libs=""
     if [[ $pkg_conf_failed ]]; then
         libs="$5"
-        if [[ $WITH_STATIC_LINKING == y && ! -z $staticopt ]]; then
-            local stlibs=$(mkl_lib_check_static "${staticopt#*=}" "$libs")
+        if [[ $WITH_STATIC_LINKING == y ]]; then
+            local stlibs=$(mkl_lib_check_static $1 "$libs")
             if [[ -n $stlibs ]]; then
-                mkl_allvar_set "$1" "${2}_STATIC" "y"
                 libs=$stlibs
             fi
         fi
     fi
 
-    if ! mkl_compile_check "$1" "$2" "$3" "$4" "$libs" "$6"; then
+    if ! mkl_compile_check "$1" "$2" "$action" "$4" "$libs" "$6"; then
         return 1
     fi
 
@@ -1124,28 +1364,85 @@ function mkl_lib_check {
 }
 
 
+# Wrapper for mkl_lib_check0 which attempts dependency installation
+# if --install-deps is specified.
+#
+# See mkl_lib_check0 for arguments and details.
+function mkl_lib_check {
+
+    if [[ $MKL_INSTALL_DEPS != y ]]; then
+        mkl_lib_check0 "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        return $?
+    fi
+
+    # Automatic dependency installation mode:
+    # First pass is lib check with cont,
+    # if it fails, attempt dependency installation,
+    # and then make second with caller's fail-action.
+
+    local arg=
+    local name=
+
+    # Find config name parameter (first non-option (--...))
+    for arg in $* ; do
+        if [[ $arg == --* ]]; then
+            continue
+        fi
+        name=$arg
+        break
+    done
+
+    local retcode=
+
+    # With --source-deps-only we want to make sure the dependency
+    # being used is in-fact from the dependency builder (if supported),
+    # rather than a system installed alternative, so skip the pre-check and
+    # go directly to dependency installation/build below.
+    if [[ $MKL_SOURCE_DEPS_ONLY != y ]] || ! mkl_dep_has_builder $1 ; then
+        mkl_lib_check0 --override-action=cont "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        retcode=$?
+        if [[ $retcode -eq 0 ]]; then
+            # Successful on first pass
+            return $retcode
+        fi
+    else
+        mkl_dbg "$name: skipping dependency pre-check in favour of --source-deps-only"
+    fi
+
+    # Install dependency
+    if ! mkl_dep_install "$name" ; then
+        return 1
+    fi
+
+    # Second pass: check again
+    mkl_lib_check0 "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    return $?
+}
+
+
+
 # Check for library with pkg-config
 # Automatically sets CFLAGS and LIBS from pkg-config information.
 # Arguments:
-#  [--static=<lib>]  (allows static linking (--enable-static) for the
-#                     library provided, e.g.: --static=-lrdkafka "librdkafka"..)
 #  [--libname=<lib>] (library name if different from config name, such as
 #                     when the libname includes a dash)
 #  config name
 #  define name
-#  action (fail|disable|ignore)
+#  action (fail|disable|ignore|cont)
 function mkl_pkg_config_check {
-
-    local staticopt=
-    if [[ $1 == --static* ]]; then
-        staticopt=$1
-        shift
-    fi
 
     local libname=$1
     if [[ $1 == --libname* ]]; then
         libname="${libnameopt#*=}"
         shift
+    fi
+
+    if [[ -n $(mkl_meta_get $1 static) && $WITH_STATIC_LINKING == y && \
+              $MKL_SOURCE_DEPS_ONLY == y ]]; then
+        # If attempting static linking and we're using source-only
+        # dependencies, then there is no need for pkg-config since
+        # the source installer will have set the required flags.
+        return 1
     fi
 
     local cname="${1}_PKGCONFIG"
@@ -1175,10 +1472,9 @@ $cflags"
 
     mkl_mkvar_append $1 "CFLAGS" "$cflags"
 
-    if [[ $WITH_STATIC_LINKING == y && ! -z $staticopt ]]; then
-        local stlibs=$(mkl_lib_check_static "${staticopt#*=}" "$libs")
+    if [[ $WITH_STATIC_LINKING == y ]]; then
+        local stlibs=$(mkl_lib_check_static $1 "$libs")
         if [[ -n $stlibs ]]; then
-            mkl_allvar_set "$1" "${2}_STATIC" "y"
             libs=$stlibs
         fi
     fi
@@ -1301,6 +1597,16 @@ function mkl_checks_run {
     # Set up common variables
     mkl_allvar_set "" MKL_APP_NAME $(mkl_meta_get description name)
     mkl_allvar_set "" MKL_APP_DESC_ONELINE "$(mkl_meta_get description oneline)"
+
+    # If --install-deps is specified, append the install deps path
+    # to compiler and linker flags.
+    if [[ $MKL_INSTALL_DEPS == y ]]; then
+        local bdir=$(mkl_depdir)
+        mkl_dbg "Adding install-deps paths ($bdir) to compiler and linker flags"
+        mkl_env_prepend CFLAGS "-I${bdir}/usr/include"
+        mkl_env_prepend LDFLAGS "-L${bdir}/usr/lib64 -L${bdir}/usr/lib"
+        mkl_env_prepend PKG_CONFIG_PATH "${bdir}/usr/lib/pkgconfig" ":"
+    fi
 
     # Call checks functions in dependency order
     local mf
@@ -1513,6 +1819,8 @@ function mkl_module_load {
 
     # Rename module's special functions so we can call them separetely later.
     mkl_func_rename "options" "${modname}_options"
+    mkl_func_rename "install_source" "${modname}_install_source"
+    mkl_func_rename "manual_checks" "${modname}_manual_checks"
     mkl_func_push MKL_CHECKS "$modname" "checks"
     mkl_func_push MKL_GENERATORS "$modname" "generate"
     mkl_func_push MKL_CLEANERS "$modname" "clean"
@@ -1586,7 +1894,7 @@ function mkl_require {
 MKL_USAGE="Usage: ./configure [OPTIONS...]
 
  mklove configure script - mklove, not autoconf
- Copyright (c) 2014-2015 Magnus Edenhill - https://github.com/edenhill/mklove
+ Copyright (c) 2014-2019 Magnus Edenhill - https://github.com/edenhill/mklove
 "
 
 function mkl_usage {
